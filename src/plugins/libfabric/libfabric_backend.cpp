@@ -354,6 +354,19 @@ nixlLibfabricEngine::nixlLibfabricEngine(const nixlBackendInitParams *init_param
                 processNotification(serialized_notif);
             });
 
+        // Setup control message handler (Producer side)
+        nixlLibfabricRail *ctrl_rail = rail_manager.getRailPtr(0);
+        if (ctrl_rail && ctrl_rail->isControlRail()) {
+            ctrl_rail->setControlMessageHandler(
+                [this](const NixlControlMessage &msg, fi_addr_t src_addr) {
+                    handleControlMessage(msg, src_addr);
+                }
+            );
+            NIXL_INFO << "Control message handler registered for Producer";
+        } else {
+            NIXL_WARN << "Control rail not available, control message handling disabled";
+        }
+
         // Set up XFER_ID tracking callbacks for all rails
         NIXL_DEBUG << "Setting up XFER_ID tracking callbacks for " << rail_manager.getNumRails()
                    << " rails";
@@ -1074,6 +1087,85 @@ nixlLibfabricEngine::postXfer(const nixl_xfer_op_t &operation,
     NIXL_DEBUG << "Processing complete: submitted " << total_submitted << " requests from "
                << desc_count << " descriptors" << " for xfer_id" << backend_handle->post_xfer_id;
 
+    // Save transfer context for Producer (for READ_REQUEST handling)
+    if (operation == NIXL_WRITE && desc_count > 0) {
+        // For WRITE operations, save the first descriptor's context
+        // This allows Producer to respond to READ_REQUEST
+        auto *local_md = static_cast<nixlLibfabricPrivateMetadata *>(local[0].metadataP);
+        auto *remote_md = static_cast<nixlLibfabricPublicMetadata *>(remote[0].metadataP);
+
+        if (local_md && remote_md && remote_md->conn_) {
+            std::lock_guard<std::mutex> lock(producer_transfers_mutex_);
+
+            ProducerTransferContext ctx;
+            ctx.buffer = local_md->buffer_;
+            ctx.length = local_md->length_;
+            ctx.rail_mr_list = local_md->rail_mr_list_;
+            ctx.selected_rails = local_md->selected_rails_;
+            ctx.remote_agent = remote_agent;
+            ctx.agent_index = remote_md->conn_->agent_index_;
+            // Note: remote_addr will be set when READ_REQUEST is received
+
+            producer_transfers_[backend_handle->post_xfer_id] = ctx;
+
+            NIXL_DEBUG << "Saved Producer transfer context for xfer_id="
+                       << backend_handle->post_xfer_id << " buffer=" << ctx.buffer
+                       << " length=" << ctx.length;
+        }
+    }
+
+    // Consumer side: Send READ_REQUEST for READ operations
+    if (operation == NIXL_READ && desc_count > 0) {
+        // Get control rail (Rail 0)
+        nixlLibfabricRail *ctrl_rail = rail_manager.getRailPtr(0);
+        if (!ctrl_rail || !ctrl_rail->isControlRail()) {
+            NIXL_ERROR << "Control rail not available for READ_REQUEST";
+            return NIXL_ERR_BACKEND;
+        }
+
+        auto *local_md = static_cast<nixlLibfabricPrivateMetadata *>(local[0].metadataP);
+        auto *remote_md = static_cast<nixlLibfabricPublicMetadata *>(remote[0].metadataP);
+
+        if (local_md && remote_md && remote_md->conn_) {
+            // Get control rail remote address
+            auto ctrl_rail_iter = remote_md->conn_->rail_remote_addr_list_.find(0);
+            if (ctrl_rail_iter == remote_md->conn_->rail_remote_addr_list_.end() ||
+                ctrl_rail_iter->second.empty()) {
+                NIXL_ERROR << "Control rail remote address not found";
+                return NIXL_ERR_BACKEND;
+            }
+            fi_addr_t ctrl_remote_addr = ctrl_rail_iter->second[0];
+
+            // For each selected data rail, send READ_REQUEST
+            for (size_t rail_id : local_md->selected_rails_) {
+                if (rail_id == 0) continue;  // Skip control rail
+
+                // Build READ_REQUEST message
+                NixlControlMessage req;
+                req.operation = NixlControlMessage::READ_REQUEST;
+                req.request_id = backend_handle->post_xfer_id;
+                req.rail_id = rail_id;
+                req.length = local[0].len;
+                req.offset = 0;
+
+                // Send READ_REQUEST via Control Rail
+                nixl_status_t status = ctrl_rail->sendControlMessage(req, ctrl_remote_addr);
+
+                if (status != NIXL_SUCCESS) {
+                    NIXL_ERROR << "Failed to send READ_REQUEST for rail " << rail_id;
+                    return status;
+                }
+
+                NIXL_DEBUG << "Sent READ_REQUEST: xfer_id=" << backend_handle->post_xfer_id
+                           << " rail=" << rail_id
+                           << " length=" << local[0].len;
+            }
+
+            NIXL_INFO << "Consumer sent READ_REQUEST for xfer_id=" 
+                      << backend_handle->post_xfer_id
+                      << " to Producer: " << remote_agent;
+        }
+    }
     // For same-agent transfers, override to 0 since we bypassed all rail operations
     if (remote_agent == localAgent) {
         backend_handle->adjust_total_submitted_requests(0);
@@ -1141,6 +1233,13 @@ nixlLibfabricEngine::checkXfer(nixlBackendReqH *handle) const {
     // Then check for completions after processing any pending completions
     if (backend_handle->is_completed()) {
         NIXL_DEBUG << "Data transfer completed successfully";
+
+        // Cleanup producer transfer context
+        {
+            std::lock_guard<std::mutex> lock(producer_transfers_mutex_);
+            producer_transfers_.erase(backend_handle->post_xfer_id);
+        }
+
         if (backend_handle->has_notif && backend_handle->operation_ == nixl_xfer_op_t::NIXL_READ) {
             nixl_status_t notif_status = notifSendPriv(backend_handle->remote_agent_,
                                                        backend_handle->binary_notifs,
@@ -1608,4 +1707,125 @@ nixlLibfabricEngine::cleanup() {
 #endif
 
     NIXL_DEBUG << "Cleanup all resources complete";
+}
+
+// Control message handler (Producer side)
+void nixlLibfabricEngine::handleControlMessage(const NixlControlMessage &msg, fi_addr_t src_addr) {
+    if (msg.operation != NixlControlMessage::READ_REQUEST) {
+        NIXL_WARN << "Unknown control message operation: " << msg.operation;
+        return;
+    }
+
+    NIXL_DEBUG << "Handling READ_REQUEST: request_id=" << msg.request_id
+               << " rail_id=" << msg.rail_id
+               << " length=" << msg.length;
+
+    // Get data rail
+    nixlLibfabricRail *data_rail = rail_manager.getRailPtr(msg.rail_id);
+    if (!data_rail) {
+        NIXL_ERROR << "Data rail not found: " << msg.rail_id;
+        return;
+    }
+
+    // Find transfer context by request_id (xfer_id)
+    ProducerTransferContext ctx;
+    {
+        std::lock_guard<std::mutex> lock(producer_transfers_mutex_);
+        auto it = producer_transfers_.find(msg.request_id);
+        if (it == producer_transfers_.end()) {
+            NIXL_ERROR << "No transfer context found for request_id=" << msg.request_id;
+            return;
+        }
+        ctx = it->second;  // Copy context
+    }
+
+    // Validate rail selection
+    bool rail_selected = false;
+    for (size_t rail_idx : ctx.selected_rails) {
+        if (rail_idx == msg.rail_id) {
+            rail_selected = true;
+            break;
+        }
+    }
+
+    if (!rail_selected) {
+        NIXL_ERROR << "Rail " << msg.rail_id << " not selected for this transfer";
+        return;
+    }
+
+    // Validate msg.length against ctx.length to prevent buffer overflow
+    if (msg.length > ctx.length) {
+        NIXL_ERROR << "Consumer requested length " << msg.length
+                   << " exceeds buffer size " << ctx.length;
+        return;
+    }
+
+    // Get MR descriptor for this rail
+    void *mr_desc = nullptr;
+    if (msg.rail_id < ctx.rail_mr_list.size() && ctx.rail_mr_list[msg.rail_id]) {
+        mr_desc = fi_mr_desc(ctx.rail_mr_list[msg.rail_id]);
+    } else {
+        NIXL_ERROR << "No MR found for rail " << msg.rail_id;
+        return;
+    }
+
+    // Allocate request for fi_senddata to track completion
+    nixlLibfabricReq *req = data_rail->allocateDataRequest(nixlLibfabricReq::SEND, msg.request_id);
+    if (!req) {
+        NIXL_ERROR << "Failed to allocate data request for fi_senddata";
+        return;
+    }
+
+    // Set completion callback to extend ctx lifetime until send completes
+    // Capture ctx by value to keep it alive
+    req->completion_callback = [ctx]() {
+        // Context kept alive until send completes
+        // No action needed, just ensure ctx lifetime
+    };
+
+    // Encode immediate data with proper format (msg_type, agent_idx, xfer_id, seq_id)
+    uint64_t immediate_data = NIXL_MAKE_IMM_DATA(
+        NIXL_LIBFABRIC_MSG_TRANSFER,
+        static_cast<uint16_t>(ctx.agent_index),
+        msg.request_id,
+        0  // seq_id = 0 for single-chunk transfer
+    );
+
+    NIXL_DEBUG << "Sending data: buffer=" << ctx.buffer
+               << " length=" << msg.length
+               << " rail=" << msg.rail_id
+               << " dest_addr=" << src_addr
+               << " immediate_data=" << std::hex << immediate_data << std::dec
+               << " (request_id=" << msg.request_id << ", agent_idx=" << ctx.agent_index << ")"
+               << " req_context=" << &req->ctx;
+
+    // Send data with fi_senddata (immediate data with proper encoding)
+    int ret = fi_senddata(data_rail->endpoint,
+                         ctx.buffer,
+                         msg.length,
+                         mr_desc,
+                         immediate_data,  // Properly encoded immediate data
+                         src_addr,
+                         &req->ctx);  // Proper context for completion tracking
+
+    if (ret == -FI_EAGAIN) {
+        // Retry on EAGAIN
+        NIXL_WARN << "fi_senddata returned EAGAIN, retrying...";
+        for (int attempt = 0; attempt < 100; attempt++) {
+            ret = fi_senddata(data_rail->endpoint, ctx.buffer, msg.length, mr_desc,
+                             immediate_data, src_addr, &req->ctx);
+            if (ret == 0) break;
+            if (ret != -FI_EAGAIN) break;
+            std::this_thread::yield();
+        }
+    }
+
+    if (ret) {
+        NIXL_ERROR << "fi_senddata failed: " << fi_strerror(-ret);
+        // Release request on error
+        data_rail->releaseRequest(req);
+        return;
+    }
+
+    NIXL_DEBUG << "Data sent successfully for READ_REQUEST: request_id=" << msg.request_id;
 }
