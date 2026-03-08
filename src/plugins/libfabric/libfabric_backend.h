@@ -209,6 +209,9 @@ private:
     // System runtime type (set during initialization from rail_manager)
     fi_hmem_iface runtime_;
 
+    // Cached connection information (serialized endpoint names)
+    std::string conn_info_;
+
     void
     cleanup();
 
