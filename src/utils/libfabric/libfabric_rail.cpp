@@ -17,6 +17,7 @@
  */
 
 #include "libfabric_rail.h"
+#include "libfabric_rail_manager.h"
 #include "common/nixl_log.h"
 #include "serdes/serdes.h"
 #include "libfabric_common.h"
@@ -389,15 +390,15 @@ nixlLibfabricRail::nixlLibfabricRail(const std::string &device,
     : rail_id(id),
       device_name(device),
       provider_name(provider),
+      control_request_pool_(NIXL_LIBFABRIC_CONTROL_REQUESTS_PER_RAIL, id),
+      data_request_pool_(NIXL_LIBFABRIC_DATA_REQUESTS_PER_RAIL, id),
+      provider_supports_hmem_(false),
       rail_manager_(rail_manager),
       is_control_rail_(id == 0),
       ctrl_recv_buffer_(nullptr),
       ctrl_recv_mr_(nullptr),
       ctrl_send_buffer_(nullptr),
-      ctrl_send_mr_(nullptr),
-      control_request_pool_(NIXL_LIBFABRIC_CONTROL_REQUESTS_PER_RAIL, id),
-      data_request_pool_(NIXL_LIBFABRIC_DATA_REQUESTS_PER_RAIL, id),
-      provider_supports_hmem_(false) {
+      ctrl_send_mr_(nullptr) {
     // Initialize all pointers to nullptr
     info = nullptr;
     fabric = nullptr;
@@ -1525,7 +1526,7 @@ nixl_status_t nixlLibfabricRail::initControlMessageBuffers() {
 
     ctrl_recv_buffer_ = (NixlControlMessage *)aligned_alloc(64, sizeof(NixlControlMessage));
     if (!ctrl_recv_buffer_) return NIXL_ERR_BACKEND;
-    memset(ctrl_recv_buffer_, 0, sizeof(NixlControlMessage));
+    *ctrl_recv_buffer_ = NixlControlMessage{};
 
     int ret = fi_mr_reg(domain, ctrl_recv_buffer_, sizeof(NixlControlMessage),
                        FI_RECV, 0, 0, 0, &ctrl_recv_mr_, nullptr);
@@ -1540,7 +1541,7 @@ nixl_status_t nixlLibfabricRail::initControlMessageBuffers() {
         free(ctrl_recv_buffer_);
         return NIXL_ERR_BACKEND;
     }
-    memset(ctrl_send_buffer_, 0, sizeof(NixlControlMessage));
+    *ctrl_send_buffer_ = NixlControlMessage{};
 
     ret = fi_mr_reg(domain, ctrl_send_buffer_, sizeof(NixlControlMessage),
                    FI_SEND, 0, 0, 0, &ctrl_send_mr_, nullptr);
